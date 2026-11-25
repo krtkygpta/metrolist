@@ -4,6 +4,9 @@ Your Metrolist library on the watch: the categories the phone actually has conte
 a player that controls what the phone plays. Picking a song starts a queue from that song; the audio always plays on
 the phone. Empty shelves such as Quick picks stay off the watch until Metrolist has something to show there.
 
+The phone half is the open-source Metrolist app with the watch link added: download the APK from
+<https://github.com/krtkygpta/metrolist/releases/latest>, no Play Store and no account beyond your own YouTube Music.
+
 Two things live in the app:
 
 - **Controller** — the phone's current track and its artist above the play button (a title too long for the row
@@ -24,11 +27,13 @@ phone, and the watch only names a category, an item number and a play / pause / 
 
 ## Requirements
 
-- [Metrolist](https://github.com/MetrolistGroup/Metrolist) with its watch link on (Settings → Watch), installed and
-  signed in on the phone. The watch link needs the patched firmware with the channel key and an App Loader from
-  2026-11-16 or later (the app owns Back, pages the controller sideways and draws with the stock LVGL widgets);
-  nothing re-pairs and Nothing X keeps working.
-- Settings → Watch also installs the bundled Metrolist watch package over that same link. Keep the watch awake during
-  the upload; no separate installer or second pairing is used.
+- **[Metrolist with the watch link](https://github.com/krtkygpta/metrolist/releases/latest)** on the phone: download
+  the APK (the release page also has the source, the `.wp2app` and the build instructions), install it next to your
+  existing Metrolist — the debug build is `com.metrolist.music.debug`, so nothing is overwritten — then open
+  **Settings → Watch** and turn the watch link on. Sign in to YouTube Music there; the watch has no account of its own.
+- FMC patched firmware with the channel key and an App Loader from 2026-11-16 or later (the app owns Back, pages the
+  controller sideways and draws with the stock LVGL widgets). Nothing re-pairs and Nothing X keeps working.
+- Settings → Watch also installs the bundled Metrolist watch package over that same link: **Install Metrolist on
+  watch**. Keep the watch awake during the upload; no separate installer or second pairing is used.
 - The watch and the phone on the same Bluetooth link: one central at a time, so no second device (a Mac, say) while
   the phone is connected.

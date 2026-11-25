@@ -1,25 +1,72 @@
-# Metrolist watch link for the CMF Watch Pro 2
+# Metrolist for the CMF Watch Pro 2
 
-Your Metrolist (YouTube Music) library on the watch, and a player that controls what the phone plays. The watch shows
-the categories the phone's Metrolist app actually has content for, a list of songs for each, and a player with
-play/pause, previous/next, the phone's volume and its queue. Picking a song starts a queue from that song; the audio
-always plays on the phone.
+**Your YouTube Music library on your wrist, and a player that runs the phone.** Browse what you actually have —
+downloads, playlists, albums, artists — start a song from the watch, then control it without pulling the phone out:
+play/pause, previous/next, the phone's volume and its queue, with the artwork's colour glowing behind the button.
 
-- `apps/metrolist/` — the watch app, the same files as the [`metrolist-companion` branch of the FMC apps
-  repository](https://github.com/fmctools/apps), which is where it can be merged into the store. `store.toml` and
-  `store.md` are its listing, and `ANDROID_COMPANION.md` is the watch-phone protocol contract.
+[**Download the Android app (APK)**](https://github.com/krtkygpta/metrolist/releases/latest) ·
+[watch app package](https://github.com/krtkygpta/metrolist/releases/latest) ·
+[how it talks to the phone](apps/metrolist/ANDROID_COMPANION.md)
+
+<img src="apps/metrolist/shots/player.jpg" width="330" alt="The player on the watch: Photograph by Ed Sheeran, a paused glowing play button, Volume and Queue below">
+
+No account, sign-in, cookie, token, track URL or file path ever crosses the Bluetooth link — only titles, artists, one
+16-bit colour and the play state. The audio always plays on the phone; the watch is a remote with a library on it.
+
+## What you get
+
+- **A player that matches the record.** The sleeve's dominant colour glows behind the play button in concentric bands
+  (the watch's LVGL has no gradient), the same colour fills the progress ring, and the controls are see-through so the
+  glow reads through them. Long titles scroll round instead of being cut off.
+- **Skip, pause, resume from the wrist.** Previous / play-pause / next, plus the phone's own volume and queue: a capsule
+  that follows the phone's volume (drag it or turn the crown) and up to 20 queue entries you can jump to.
+- **A library that is really yours.** The watch lists the categories the phone's Metrolist has content for, and opens
+  downloads, playlists, albums and artists; empty shelves such as Quick picks stay off the watch. Picking a song
+  starts a queue from there.
+- **A page next to the watch face.** Long press the app's row in Apps → Add page, and the player sits one swipe from
+  the face with no browsing around it.
+- **One pairing, nothing disturbed.** The link reuses the watch's existing bond through the app channel, so Nothing X
+  keeps working and there is no second "Paired" popup.
+
+## Screenshots
+
+| The player | Library | The queue |
+|---|---|---|
+| <img src="apps/metrolist/shots/player.jpg" width="290" alt="Player screen"> | <img src="apps/metrolist/shots/home.jpg" width="290" alt="Metrolist categories"> | <img src="apps/metrolist/shots/queue.jpg" width="290" alt="Queue screen"> |
+
+## Install
+
+1. **On the phone** — download the APK from the [latest release](https://github.com/krtkygpta/metrolist/releases/latest)
+   and install it. The build is `com.metrolist.music.debug`, so it installs next to a release Metrolist instead of
+   replacing it. It is debug-signed: enable "install unknown apps" for your browser or file manager, and expect Play
+   Protect to ask once. Sign in to YouTube Music inside the app.
+2. **On the phone** — open **Settings → Watch**, turn the watch link on, and use **Install Metrolist on watch** to
+   push the watch app through the same Bluetooth link.
+3. **On the watch** — open Metrolist from the Apps row. The player is also available as a page (long press its row →
+   Add page).
+
+The release page also carries the standalone `.wp2app`, if you would rather install the watch half with the App Loader
+from a PC.
+
+## Requirements
+
+- A CMF Watch Pro 2 with the [FMC patched firmware and App Loader](https://fmc.freethinkel.dev/firmware): the channel
+  key needs a stub and loader from 2026-11-13 or newer, and this app (it owns Back, pages the controller sideways and
+  draws with the stock LVGL widgets) a loader from 2026-11-16 or newer. Stock firmware has no app channel at all.
+- Android 9 or newer on the phone, with the Nothing X app still installed — the link rides the existing bond.
+- One central at a time: while the phone is connected, no other device (a Mac, say) can hold the watch.
+
+## What's in this repository
+
+- `apps/metrolist/` — the watch app, the same files as the
+  [`metrolist-companion` branch of the FMC apps repository](https://github.com/fmctools/apps), which is where it can
+  be merged into the FMC store. `store.toml`, `store.md` and `shots/` are its store listing, and
+  `ANDROID_COMPANION.md` is the watch-phone protocol contract.
 - `android/` — the Android companion: [MetrolistGroup/Metrolist](https://github.com/MetrolistGroup/Metrolist) plus the
-  watch link (Settings → Watch). It owns the account, the downloads, the library and the player; the watch only names a
-  category, an item and a command.
+  watch link (Settings → Watch, `com.metrolist.android.watch`). It owns the account, the downloads, the library and
+  the player; the watch only names a category, an item and a command.
 
-Nothing personal crosses the Bluetooth link: no account, sign-in, cookie, token, track URL or file path. Only titles,
-artists, 16-bit row colours and play state. Anyone in BLE range can read the channel, so it is built that way.
-
-## Installing the watch app from a PC
-
-A watch with the [FMC patched firmware and App Loader](https://fmc.freethinkel.dev/firmware) is required: the channel
-key K needs a stub and loader from 2026-11-13 or newer, and `own_back` / the player page need a loader from
-2026-11-16 or newer.
+## Build the watch app from source
 
 Toolchain: [Rust](https://rustup.rs) with `rustup target add thumbv7em-none-eabi` and
 `rustup component add llvm-tools`, [uv](https://docs.astral.sh/uv/), [resvg](https://github.com/linebender/resvg),
@@ -33,10 +80,9 @@ make test APP=metrolist        # host tests, including every LVGL batch
 make build APP=metrolist       # target/metrolist.wp2app
 ```
 
-Then install the `.wp2app` with the App Loader. From the phone it is also bundled in the companion: Settings → Watch →
-**Install Metrolist on watch** sends the same package over the channel, with no second pairing.
+Then install `target/metrolist.wp2app` with the App Loader.
 
-## Building the Android app
+## Build the Android app
 
 Metrolist is Kotlin Multiplatform and the BLE link is Android-only, so the app needs upstream's toolchain: JDK 21,
 Android SDK platform `android-37.1`, NDK `30.0.16248370`, CMake `4.1.2`, and the `metroproto` and `libopus` sources
@@ -47,9 +93,6 @@ cd android
 ./gradlew :androidApp:assembleDebug              # androidApp/build/outputs/apk/debug/androidApp-debug.apk
 ./gradlew :androidApp:testDebugUnitTest --tests 'com.metrolist.android.watch.*'
 ```
-
-The debug build is `com.metrolist.music.debug`, so it installs next to a release Metrolist. Nothing X keeps working: the
-watch is already bonded there and the link uses the app channel, not a second pairing.
 
 ## Before calling it shipped
 
