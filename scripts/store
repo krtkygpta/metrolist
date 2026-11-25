@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""Store apps: apps/<name>/ with a store.toml. See README.md. The Makefile wraps this; run it through `make`,
+which fetches the pinned SDK first and puts llvm-objcopy on PATH.
+
+  scripts/store changed BASE      apps to build-check for a change since BASE: the ones it touches, all of them
+                                  when it touches the SDK pin or the build tooling
+  scripts/store bumps BASE        fail unless every app touched since BASE raised its version (a new app: any)
+  scripts/store released BASE     apps whose version went up since BASE (new ones too): what main publishes
+  scripts/store check [NAME...]   validate the listings (all without NAME)
+  scripts/store build NAME...     check, then build target/<name>.wp2app with the pinned wp2-apps tooling;
+                                  icon.svg -> target/<name>-icon.png, the store's icon
+  scripts/store publish NAME...   send target/<name>.wp2app, -icon.png + the listing to the store
+                                  (STORE_URL, STORE_PUBLISH_TOKEN; --dry-run: the store
+                                  validates and answers what would change, saves nothing)
+"""
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tomllib
+
+ROOT = Path(__file__).resolve().parent.parent
+APPS = ROOT / "apps"
+SDK = ROOT / ".sdk/wp2-apps"
+TARGET = ROOT / "target"
+# a change here can change every package
+SHARED = ("apps/Cargo.toml", "apps/Cargo.lock", "apps/.cargo/", "Makefile", "scripts/store", ".github/workflows/store.yml")
+# key: (type, max length); the store's limits (fmc_pocketbase, migration 1754000000_store.js)
+KEYS = {"name": (str, 60), "summary": (str, 140), "version": (str, 24), "author": (str, 60),
+        "published": (bool, None), "screenshots": (list, 8)}
+VERSION = re.compile(r"(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})")
+IMAGES = {".png", ".jpg", ".jpeg", ".webp", ".svg"}
+
+
+def apps():
+    return sorted(p.parent.name for p in APPS.glob("*/store.toml"))
+
+
+def version(text):
+    """"1.2.3" -> (1, 2, 3); raises ValueError. Each part stays under 1024, so `build` below stays monotonic."""
+    match = VERSION.fullmatch(text)
+    if not match:
+        raise ValueError(f"version {text!r} is not MAJOR.MINOR.PATCH (each part at most 999)")
+    return tuple(int(n) for n in match.groups())
+
+
+def build_number(text):
+    """The .wp2app header's u32 version, derived from the listing's version: it goes up whenever that does."""
+    major, minor, patch = version(text)
+    return major << 20 | minor << 10 | patch
+
+
+def touched(base):
+    """Files changed since BASE, or None when BASE can't be diffed (a new branch, a force push)."""
+    if set(base) == {"0"}:  # a new branch pushes 0000…
+        return None
+    diff = subprocess.run(["git", "diff", "--name-only", base, "HEAD"], cwd=ROOT, capture_output=True, text=True)
+    return None if diff.returncode else diff.stdout.split()
+
+
+def version_at(base, name):
+    """The app's version at BASE, None when it had no listing there."""
+    show = subprocess.run(["git", "show", f"{base}:apps/{name}/store.toml"], cwd=ROOT, capture_output=True, text=True)
+    return version(tomllib.loads(show.stdout)["version"]) if show.returncode == 0 else None
+
+
+def changed(base):
+    files = touched(base)
+    if files is None or any(f.startswith(SHARED) for f in files):
+        return apps()
+    return [a for a in apps() if any(f.startswith(f"apps/{a}/") for f in files)]
+
+
+def bumps(base):
+    """An app's files change only together with a higher version; a version never goes down."""
+    files = touched(base)
+    if files is None:
+        raise ValueError(f"can't diff against {base}")
+    errors = []
+    for name in apps():
+        old, new = version_at(base, name), version(listing(name)[0]["version"])
+        if old is not None and new < old:
+            errors.append(f"{name}: version went down, {'.'.join(map(str, old))} -> {'.'.join(map(str, new))}")
+        elif old is not None and new == old and any(f.startswith(f"apps/{name}/") for f in files):
+            errors.append(f"{name}: changed, but its version in store.toml is still {'.'.join(map(str, old))}")
+    if errors:
+        raise ValueError("\n".join(errors))
+
+
+def released(base):
+    """The apps a push to main publishes: a new listing, or a higher version than at BASE."""
+    if set(base) == {"0"}:  # the first push of a branch: everything on it is new
+        return apps()
+    if touched(base) is None:
+        raise ValueError(f"can't diff against {base}; publish by hand with workflow_dispatch")
+    return [a for a in apps() if version_at(base, a) is None or version(listing(a)[0]["version"]) > version_at(base, a)]
+
+
+def listing(name):
+    """The store.toml of `name`, checked; raises ValueError."""
+    folder = APPS / name
+    if not re.fullmatch(r"[a-z0-9_-]{1,23}", name):
+        raise ValueError(f"{name}: an app name is 1-23 lowercase letters, digits, - and _")
+    if not (folder / "store.toml").is_file():
+        raise ValueError(f"{name}: apps/{name}/store.toml is missing")
+    cargo = tomllib.loads((folder / "Cargo.toml").read_text())
+    if cargo["package"]["name"] != name:
+        raise ValueError(f"{name}: the crate in apps/{name}/Cargo.toml must be named {name!r}")
+    meta = tomllib.loads((folder / "store.toml").read_text())
+    for key, value in meta.items():
+        if key not in KEYS:
+            raise ValueError(f"{name}/store.toml: unknown key {key!r}")
+        kind, limit = KEYS[key]
+        if type(value) is not kind:
+            raise ValueError(f"{name}/store.toml: {key} must be a {kind.__name__}")
+        if limit and len(value) > limit:
+            raise ValueError(f"{name}/store.toml: {key} is longer than {limit}")
+    for key in ("name", "version"):
+        if key not in meta:
+            raise ValueError(f"{name}/store.toml: {key} is required")
+    version(meta["version"])
+    description = (folder / "store.md").read_text() if (folder / "store.md").exists() else ""
+    if len(description) > 8000:
+        raise ValueError(f"{name}/store.md is longer than 8000 characters")
+    shots = [folder / s for s in meta.get("screenshots", [])]
+    for shot in shots:
+        if shot.suffix.lower() not in IMAGES or not shot.is_file() or shot.stat().st_size > 2 << 20:
+            raise ValueError(f"{name}: screenshot {shot.name} must be a png/jpeg/webp/svg file of at most 2 MB")
+    return meta, description, shots
+
+
+def wp2apps(*args, module=None):
+    """The pinned wp2-apps CLI (or one of its modules), from the SDK checkout's own locked environment."""
+    run = ["uv", "run", "--quiet", "--locked", "--project", SDK]
+    subprocess.run(run + (["python", "-m", module] if module else ["wp2apps"]) + [str(a) for a in args],
+                   cwd=ROOT, check=True)
+
+
+def build(name):
+    """What wp2-apps scripts/build-app does, for apps/<name>."""
+    meta = listing(name)[0]
+    if not (SDK / "pyproject.toml").is_file():
+        raise ValueError("the SDK checkout is missing: run `make sdk`")
+    env = dict(os.environ)
+    svg = APPS / name / "icon.svg"
+    if svg.exists():
+        icons = TARGET / "icons"
+        icons.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["resvg", "-w", "96", "-h", "96", svg, icons / f"{name}.png"], check=True)
+        wp2apps(icons / f"{name}.png", icons / f"{name}.wp2icon", module="wp2apps.icon")
+        env["WP2_ICON"] = str(icons / f"{name}.wp2icon")
+    # the SDK sits outside the workspace, so panic locations would carry this machine's absolute path to it;
+    # remapped, a package is the same on every machine (appended to apps/.cargo/config.toml's rustflags)
+    # Cargo parses --config as TOML; native Windows backslashes in a quoted value are escapes there.
+    remap = f'target.thumbv7em-none-eabi.rustflags=["--remap-path-prefix={SDK.as_posix()}=wp2-apps"]'
+    subprocess.run(["cargo", "build", "--release", "-p", name, "--config", remap], cwd=APPS, env=env, check=True)
+    elf = TARGET / "thumbv7em-none-eabi/release" / name
+    subprocess.run(["llvm-objcopy", "-O", "binary", "--set-section-flags", ".data=alloc,load,contents",
+                    elf, TARGET / f"{name}.bin"], check=True)
+    (TARGET / f"{name}.wp2app").unlink(missing_ok=True)
+    wp2apps("pack", TARGET / f"{name}.bin", "--elf", elf, "--name", name, "--version", build_number(meta["version"]),
+            "--output", TARGET / f"{name}.wp2app")
+    wp2apps("info", TARGET / f"{name}.wp2app")
+    if svg.exists():  # the store's icon; an icon.svg may pull in images by relative path
+        subprocess.run(["resvg", "-w", "288", "-h", "288", svg, TARGET / f"{name}-icon.png"], check=True)
+
+
+def publish(name, dry_run):
+    meta, description, shots = listing(name)
+    repo = os.environ.get("GITHUB_REPOSITORY", "cmf-tech-community/apps")
+    fields = {
+        "slug": name, "name": meta["name"], "summary": meta.get("summary", ""), "description": description,
+        "version": meta.get("version", ""), "author": meta.get("author", ""),
+        "source": f"https://github.com/{repo}/tree/main/apps/{name}",
+        "published": str(meta.get("published", False)).lower(), "dry": "1" if dry_run else "",
+    }
+    args = ["curl", "--silent", "--show-error", "--fail-with-body", "--retry", "2",
+            "--header", "@-", f"{os.environ['STORE_URL'].rstrip('/')}/api/store/publish",
+            "--form", f"package=@{TARGET / f'{name}.wp2app'}"]
+    for key, value in fields.items():
+        args += ["--form-string", f"{key}={value}"]
+    icon = TARGET / f"{name}-icon.png"
+    if icon.exists():
+        args += ["--form", f"icon=@{icon}"]
+    for shot in shots:
+        args += ["--form", f"screenshots=@{shot}"]
+    # the token goes in on stdin, so it never shows up in the process list
+    auth = f"Authorization: Bearer {os.environ['STORE_PUBLISH_TOKEN']}\n"
+    out = subprocess.run(args, input=auth, capture_output=True, text=True)
+    if out.returncode:
+        raise SystemExit(f"{name}: publish failed: {out.stdout or out.stderr}")
+    print(json.dumps(json.loads(out.stdout)))
+
+
+def main(argv):
+    if not argv or argv[0] not in ("changed", "bumps", "released", "check", "build", "publish"):
+        raise SystemExit(__doc__)
+    command, rest = argv[0], argv[1:]
+    try:
+        if command in ("changed", "released"):
+            print(" ".join((changed if command == "changed" else released)(rest[0])))
+        elif command == "bumps":
+            bumps(rest[0])
+        elif command == "check":
+            for name in rest or apps():
+                listing(name)
+                print(f"{name}: ok")
+        elif command == "build":
+            for name in rest:
+                build(name)
+        else:
+            dry_run = "--dry-run" in rest
+            for name in (a for a in rest if a != "--dry-run"):
+                publish(name, dry_run)
+    except (ValueError, OSError, KeyError, IndexError, subprocess.CalledProcessError) as error:
+        raise SystemExit(f"error: {error}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

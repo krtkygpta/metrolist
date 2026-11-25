@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["*"]
+exclude = [".cargo", "target"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+
+# The SDK, from the wp2-apps checkout `make sdk` puts at the commit pinned in the Makefile (WP2_APPS_REV).
+[workspace.dependencies]
+cmf-wp2-app = { path = "../.sdk/wp2-apps/sdk/cmf-wp2-app" }
+cmf-wp2-ui = { path = "../.sdk/wp2-apps/sdk/cmf-wp2-ui" }
+wp2-core = { path = "../.sdk/wp2-apps/fw/wp2-core" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+codegen-units = 1

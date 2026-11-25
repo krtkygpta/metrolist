@@ -1,0 +1,17 @@
+/target/
+/.sdk/
+/runs/
+.DS_Store
+
+# The Android fork
+*.apk
+*.aab
+*.keystore
+*.jks
+local.properties
+.gradle/
+build/
+.kotlin/
+.idea/
+.cxx/
+*.log
