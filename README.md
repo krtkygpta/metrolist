@@ -26,7 +26,7 @@ Toolchain: [Rust](https://rustup.rs) with `rustup target add thumbv7em-none-eabi
 `make`, and a C linker.
 
 ```bash
-git clone https://github.com/<you>/metrolist
+git clone https://github.com/krtkygpta/metrolist
 cd metrolist
 make sdk                       # fetch cmf-watch-sdk at the pinned commit into .sdk/wp2-apps
 make test APP=metrolist        # host tests, including every LVGL batch
