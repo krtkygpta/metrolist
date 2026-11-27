@@ -18,7 +18,9 @@ import com.metrolist.android.watch.WatchNodeBook.Kind
 import com.metrolist.android.watch.WatchNodeBook.Node
 import com.metrolist.shared.api.YouTubeRepository
 import com.metrolist.shared.db.MusicDatabase
+import android.util.Log
 import com.metrolist.shared.db.entities.toSongItem
+import com.metrolist.shared.model.AlbumItem
 import com.metrolist.shared.model.HomeSection
 import com.metrolist.shared.model.PlaylistItem
 import com.metrolist.shared.model.SongItem
@@ -47,6 +49,9 @@ internal class WatchContent(
     /** Mood tiles opened from the watch: node id -> browse id. */
     private val childBrowse = HashMap<Int, String>()
 
+    /** Album rows opened from the watch: node id -> album browse id. Its songs load when the watch opens it. */
+    private val childAlbums = HashMap<Int, String>()
+
     private val childTitles = HashMap<Int, String>()
 
     private val lock = Mutex()
@@ -54,20 +59,56 @@ internal class WatchContent(
     suspend fun build(): Built =
         lock.withLock {
             childBrowse.clear()
+            childAlbums.clear()
             childTitles.clear()
             val dao = database.dao()
             val home = runCatching { repository.getHomePageData() }.getOrNull()
+            val feed = ArrayList<HomeSection>(home?.sections.orEmpty())
+            // Quick picks is not always on the first page of the feed, and a single browse misses it entirely then: walk
+            // at most two continuation pages, and only while the shelf has not shown up.
+            var token = home?.continuation
+            var pages = 0
+            while (token != null && pages < 2 && shelfSongs(feed, QUICK_SHELF, "Quick picks").isEmpty()) {
+                val page =
+                    runCatching { repository.getHomeSectionsContinuation(token, loadAllPages = false) }.getOrNull()
+                        ?: break
+                feed += page.first
+                token = page.second
+                pages++
+            }
+            val apiQuick = shelfSongs(feed, QUICK_SHELF, "Quick picks")
+            // The app's own Quick picks is the API shelf and the local history together, not one or the other: a fresh
+            // install has the first, an offline or signed-out one the second. The most played songs of all time are the
+            // last resort, so the shelf holds songs instead of an empty list.
             val quick =
-                shelfSongs(home?.sections, "FEmusic_quickpicks").ifEmpty {
-                    runCatching { dao.quickPicks().first().map { it.toSongItem() } }.getOrDefault(emptyList())
-                }
-            val listen =
-                shelfSongs(home?.sections, "FEmusic_listen_again").ifEmpty {
-                    val monthAgo = System.currentTimeMillis() - 30L * 24L * 60L * 60L * 1000L
+                mergeSongs(
+                    apiQuick,
+                    runCatching { dao.quickPicks().first().map { it.toSongItem() } }.getOrDefault(emptyList()),
                     runCatching {
-                        dao.mostPlayedSongs(fromTimeStamp = monthAgo).first().map { it.toSongItem() }
-                    }.getOrDefault(emptyList())
-                }
+                        dao.mostPlayedSongs(fromTimeStamp = 0L, limit = WatchProtocol.MAX_ITEMS).first()
+                            .map { it.toSongItem() }
+                    }.getOrDefault(emptyList()),
+                    runCatching { dao.forgottenFavorites().first().map { it.toSongItem() } }.getOrDefault(emptyList()),
+                ).take(WatchProtocol.MAX_ITEMS)
+            val listen =
+                mergeSongs(
+                    shelfSongs(feed, LISTEN_SHELF, "Listen again"),
+                    runCatching {
+                        val monthAgo = System.currentTimeMillis() - 30L * 24L * 60L * 60L * 1000L
+                        dao.mostPlayedSongs(fromTimeStamp = monthAgo, limit = WatchProtocol.MAX_ITEMS).first()
+                            .map { it.toSongItem() }
+                    }.getOrDefault(emptyList()),
+                ).take(WatchProtocol.MAX_ITEMS)
+            // One line per rebuild: when the watch shows an empty shelf, logcat says whether the phone had rows to send.
+            Log.i(
+                WATCH_LOG,
+                "feed ${feed.size} sections, quick ${apiQuick.size}/${quick.size}, listen ${listen.size}" +
+                    if (quick.isEmpty()) {
+                        ": " + feed.joinToString { "${it.title}|${it.browseId}|${it.items.size}" }
+                    } else {
+                        ""
+                    },
+            )
             val downloads =
                 runCatching { dao.downloadedSongsByCreateDateAsc().first().map { it.toSongItem() } }
                     .getOrDefault(emptyList())
@@ -98,7 +139,9 @@ internal class WatchContent(
             val (exploreRoot, exploreNodes) = exploreNode()
             val rootEntries =
                 buildList {
-                    if (quick.isNotEmpty()) add(folder("Quick picks", quick.size, ID_QUICK, "quick"))
+                    // Always offered, even empty: it is the app's first shelf, and a shelf that vanished from the
+                    // watch's menu whenever its rows were not ready read as a missing feature.
+                    add(folder("Quick picks", quick.size, ID_QUICK, "quick"))
                     if (listen.isNotEmpty()) add(folder("Listen again", listen.size, ID_LISTEN, "listen"))
                     if (downloads.isNotEmpty()) add(folder("Downloads", downloads.size, ID_DOWNLOADS, "downloads"))
                     if (library.isNotEmpty()) add(folder("Library", library.size, ID_LIBRARY, "library"))
@@ -108,7 +151,7 @@ internal class WatchContent(
             val sectionNodes = ArrayList<Node>()
             val sectionKinds = HashMap<Int, Kind>()
             var dynamicId = DYNAMIC_FIRST
-            for (section in home?.sections.orEmpty()) {
+                            for (section in feed) {
                 if (rootEntries.size >= WatchProtocol.MAX_ROOT || dynamicId > WatchNodeBook.MAX_NODE) break
                 if (section.title in seenTitles) continue
                 val songs =
@@ -123,6 +166,39 @@ internal class WatchContent(
                     sectionKinds[dynamicId] = Kind.SONGS
                     seenTitles.add(section.title)
                     dynamicId++
+                    continue
+                }
+
+                // A shelf of albums (New releases, Trending, ...): each album opens its own track list, so a tap on a
+                // song there plays the album from that song. The albums' covers are not read (the watch's list does
+                // not tint rows): twenty artwork loads would only delay the shelf.
+                val albums =
+                    section.items
+                        .filterIsInstance<AlbumItem>()
+                        .distinctBy { it.id }
+                        .take(WatchProtocol.MAX_ITEMS)
+                if (albums.isNotEmpty()) {
+                    val folderNode = dynamicId
+                    val after = folderNode + albums.size
+                    if (after > WatchNodeBook.MAX_NODE) break
+                    val entries = ArrayList<Entry>(albums.size)
+                    for ((i, album) in albums.withIndex()) {
+                        val id = folderNode + 1 + i
+                        childAlbums[id] = album.id
+                        childTitles[id] = album.title
+                        entries +=
+                            Entry.Folder(
+                                title = album.title,
+                                artist = album.artists.joinToString(", ") { it.name },
+                                colour = 0,
+                                node = id,
+                            )
+                    }
+                    rootEntries.add(folder(section.title, albums.size, folderNode, "section-$folderNode"))
+                    sectionNodes.add(Node(folderNode, section.title, Kind.FOLDER, entries))
+                    sectionKinds[folderNode] = Kind.FOLDER
+                    seenTitles.add(section.title)
+                    dynamicId = after + 1
                     continue
                 }
 
@@ -171,10 +247,53 @@ internal class WatchContent(
     /** The playing track's dominant artwork colour (RGB565) for the watch's player glow. */
     suspend fun colourOf(song: SongItem): Int = colours.of(song.thumbnail, "now:${song.id}")
 
-    /** Loads a mood node the root advertised but that is not built yet; `null` when it cannot be read. */
+    /**
+     * The phone's best matches for a name typed on the watch, as the watch's list. A `SongItem` from the search goes
+     * straight into the player, so choosing one plays the phone's own result and the rest stay queued behind it. No
+     * artwork is fetched here: the list page does not tint rows, and five covers would only delay the answer.
+     */
+    suspend fun search(query: String): Node? {
+        val results = runCatching { repository.search(query.trim()) }.getOrNull() ?: return null
+        val songs =
+            results
+                .filterIsInstance<SongItem>()
+                .distinctBy { it.id }
+                .take(WatchProtocol.MAX_SEARCH)
+        return Node(
+            WatchProtocol.SEARCH_NODE,
+            "Results",
+            Kind.SONGS,
+            songs.map { song ->
+                Entry.Track(
+                    title = song.customTitle ?: song.title,
+                    artist = song.artists.joinToString(", ") { it.name },
+                    colour = 0,
+                    song = song,
+                )
+            },
+        )
+    }
+
+    /**
+     * Loads a node the root advertised but that is not built yet: an album's tracks, or a mood shelf's songs. `null`
+     * when it cannot be read.
+     */
     suspend fun loadChild(nodeId: Int): Node? =
         lock.withLock {
-            val browseId = childBrowse[nodeId] ?: return null
+            val albumId = childAlbums[nodeId]
+            if (albumId != null) {
+                val page = runCatching { repository.getAlbum(albumId) }.getOrNull() ?: return@withLock null
+                // The album page carries its tracks in album order, which is the order the watch plays down.
+                val songs = page.songs.distinctBy { it.id }.take(WatchProtocol.MAX_ITEMS)
+                return@withLock Node(
+                    id = nodeId,
+                    title = page.album.title.ifBlank { childTitles[nodeId] ?: "Album" },
+                    kind = Kind.SONGS,
+                    entries = tracks(songs, "album-$nodeId"),
+                    fromAlbum = true,
+                )
+            }
+            val browseId = childBrowse[nodeId] ?: return@withLock null
             val title = childTitles[nodeId] ?: "Explore"
             val page = runCatching { repository.getBrowsePageData(browseId) }.getOrNull() ?: return null
             val songs =
@@ -242,15 +361,21 @@ internal class WatchContent(
             node = node,
         )
 
+    /**
+     * The songs of a home shelf: by its browse id, or by its title (a localized home response does not always carry
+     * the browse id, and the app's own Quick picks shelf is matched by name too).
+     */
     private fun shelfSongs(
         sections: List<HomeSection>?,
         browseId: String,
+        title: String,
     ): List<SongItem> =
         sections.orEmpty()
-            .firstOrNull { it.browseId?.startsWith(browseId) == true }
-            ?.items
-            ?.filterIsInstance<SongItem>()
-            .orEmpty()
+            .filter { it.browseId?.startsWith(browseId) == true || it.title.equals(title, ignoreCase = true) }
+            .flatMap { it.items.filterIsInstance<SongItem>() }
+            .distinctBy { it.id }
+
+    private fun mergeSongs(vararg lists: List<SongItem>): List<SongItem> = lists.flatMap { it }.distinctBy { it.id }
 
     private fun fallbackColour(seed: String): Int {
         val hue = (seed.hashCode() and 0x7FFFFFFF) % 360
@@ -258,6 +383,11 @@ internal class WatchContent(
     }
 
     companion object {
+        /** The link service's own log tag, so one logcat filter shows the whole watch path. */
+        private const val WATCH_LOG = "MetrolistWatch"
+        private const val QUICK_SHELF = "FEmusic_quickpicks"
+        private const val LISTEN_SHELF = "FEmusic_listen_again"
+
         const val ID_QUICK = 1
         const val ID_LISTEN = 2
         const val ID_DOWNLOADS = 3

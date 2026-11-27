@@ -10,8 +10,8 @@
 //!   `?`                               hello: app started, resumed or lost the phone; send the state and the root
 //!   `b` node                          browse node `0` (root categories) or a folder the phone named
 //!   `p` node index                    play item `index` of node `node`; the phone queues the node from there
+//!   `f` len query                     search the library; the phone answers with list frames for `SEARCH_NODE`
 //!   `t` cmd                           transport: 0 play/pause, 1 next, 2 previous
-//!   `v` level                         volume 0..=100
 //!   `q`                               send the queue (the controller's second page)
 //!   `j` index                         play queue entry `index` of the current queue
 //!
@@ -28,6 +28,8 @@
 //!                                     items `start..start+n` of that list; a folder item's `id` is its node
 //!   `E` node total                    the list is complete
 //!   `X` node code                     no list: 0 empty, 1 error, 2 the phone is not ready
+//!                                     a search's results are an ordinary list for node `SEARCH_NODE` (250): the
+//!                                     phone sends `B`/`I`/`E` with that node, and `p 250 index` plays from them
 //!   `Q` total current                 the queue starts: `total` entries follow, `current` plays
 //!   `J` start n (tlen title alen artist colour:u16le)*
 //!                                     queue entries `start..start+n`; the queue is ready at `total`
@@ -35,12 +37,18 @@
 //!
 //! Names: a list title is at most 20 bytes, a category name 20, a track title 34, an artist 20. A two-item `I` frame
 //! stays under 128 bytes with those limits, which is why the phone clips them.
+//!
+//! The volume is not a frame: the watch steps the phone's own media volume with the loader's media keys
+//! (`Api::media_key`), so it needs no link of this app's own. The `vol` byte of `S` is the phone's player gain, which
+//! the watch reads no longer.
 
 pub const MAGIC: [u8; 2] = *b"M1";
 pub const MSG_MAX: usize = 128;
 
 pub const MAX_ITEMS: usize = 20;
-pub const MAX_ROOT: usize = 6;
+/// Root categories the phone may send: its own shelves (Quick picks, Listen again, Downloads, Library, Explore) and up
+/// to three home shelves of songs or albums. A `C` frame carries all eight with full names.
+pub const MAX_ROOT: usize = 8;
 pub const DEPTH_MAX: usize = 4;
 
 pub const TITLE_MAX: usize = 34;
@@ -54,9 +62,16 @@ pub const HELLO: u8 = b'?';
 pub const BROWSE: u8 = b'b';
 pub const PLAY: u8 = b'p';
 pub const TRANSPORT: u8 = b't';
-pub const VOLUME: u8 = b'v';
 pub const QUEUE_REQ: u8 = b'q';
 pub const QUEUE_PLAY: u8 = b'j';
+pub const SEARCH: u8 = b'f';
+
+/// The node the phone streams a search's results as. It is never part of the browse tree, so a list frame for it can
+/// only be an answer to `f`.
+pub const SEARCH_NODE: u8 = 250;
+
+/// The longest query the watch's keyboard sends; a `f` frame is 4 bytes plus the query, well under 128.
+pub const SEARCH_MAX: usize = 24;
 
 pub const NOW: u8 = b'S';
 pub const CATEGORIES: u8 = b'C';
@@ -87,9 +102,6 @@ pub const CMD_TOGGLE: u8 = 0;
 pub const CMD_NEXT: u8 = 1;
 pub const CMD_PREV: u8 = 2;
 
-/// One crown detent changes the volume by this many percent.
-pub const VOL_STEP: i16 = 5;
-
 pub const ROOT_TITLE: &str = "Metrolist";
 
 fn text(bytes: &[u8], len: u8) -> &str {
@@ -102,8 +114,6 @@ pub struct Now {
     pub playing: bool,
     /// 0..=100.
     pub pos: u8,
-    /// 0..=100.
-    pub vol: u8,
     pub tlen: u8,
     pub title: [u8; TITLE_MAX],
     pub alen: u8,
@@ -117,7 +127,6 @@ impl Now {
         has: false,
         playing: false,
         pos: 0,
-        vol: 50,
         tlen: 0,
         title: [0; TITLE_MAX],
         alen: 0,
@@ -333,11 +342,6 @@ impl Model {
         Some(parent)
     }
 
-    /// The playing track's volume after `delta` crown detents, kept in 0..=100.
-    pub fn step_volume(level: u8, delta: i16) -> u8 {
-        (level as i16 + delta * VOL_STEP).clamp(0, 100) as u8
-    }
-
     pub fn browse_frame(node: u8) -> [u8; 4] {
         [b'M', b'1', BROWSE, node]
     }
@@ -346,12 +350,20 @@ impl Model {
         [b'M', b'1', PLAY, node, index]
     }
 
-    pub fn transport_frame(cmd: u8) -> [u8; 4] {
-        [b'M', b'1', TRANSPORT, cmd]
+    /// The keyboard's finished query. Only the first `4 + len` bytes are the frame; the rest stays zero.
+    pub fn search_frame(query: &[u8]) -> [u8; SEARCH_MAX + 4] {
+        let mut f = [0u8; SEARCH_MAX + 4];
+        f[0] = b'M';
+        f[1] = b'1';
+        f[2] = SEARCH;
+        let n = query.len().min(SEARCH_MAX);
+        f[3] = n as u8;
+        f[4..4 + n].copy_from_slice(&query[..n]);
+        f
     }
 
-    pub fn volume_frame(level: u8) -> [u8; 4] {
-        [b'M', b'1', VOLUME, level.min(100)]
+    pub fn transport_frame(cmd: u8) -> [u8; 4] {
+        [b'M', b'1', TRANSPORT, cmd]
     }
 
     pub fn hello_frame() -> [u8; 3] {
@@ -432,7 +444,6 @@ impl Model {
             has: flags & NOW_HAS_TRACK != 0,
             playing: flags & NOW_PLAYING != 0,
             pos: msg[4],
-            vol: msg[5],
             tlen,
             title,
             alen,
@@ -737,6 +748,26 @@ mod tests {
     }
 
     #[test]
+    fn eight_root_categories_fit_the_watch() {
+        let mut m = Model::new();
+        let cats: [(u8, u8, &str, u16); 8] = [
+            (1, KIND_SONGS, "Quick picks", 0x1111),
+            (2, KIND_SONGS, "Listen again", 0x2222),
+            (3, KIND_FOLDER, "Downloads", 0x3333),
+            (4, KIND_FOLDER, "Library", 0x4444),
+            (5, KIND_FOLDER, "Explore", 0x5555),
+            (6, KIND_FOLDER, "New releases", 0x6666),
+            (7, KIND_FOLDER, "Trending now", 0x7777),
+            (8, KIND_SONGS, "Chill", 0x8888),
+        ];
+        assert!(m.apply(&cat_frame(&cats), 1).root);
+        assert_eq!(m.root_count, 8);
+        assert_eq!(m.root[5].label(), "New releases");
+        assert!(m.root[5].is_folder());
+        assert_eq!(m.root[7].colour, 0x8888);
+    }
+
+    #[test]
     fn a_list_streams_in_and_is_ready_on_the_end_frame() {
         let mut m = Model::new();
         root(&mut m);
@@ -834,7 +865,6 @@ mod tests {
         assert_eq!(Model::transport_frame(CMD_NEXT), *b"M1t\x01");
         assert_eq!(Model::play_frame(4, 7), *b"M1p\x04\x07");
         assert_eq!(Model::browse_frame(0), *b"M1b\x00");
-        assert_eq!(Model::volume_frame(140), *b"M1v\x64");
         assert_eq!(Model::hello_frame(), *b"M1?");
         assert_eq!(Model::queue_frame(), *b"M1q");
         assert_eq!(Model::queue_play_frame(7), *b"M1j\x07");
@@ -870,15 +900,6 @@ mod tests {
         assert_eq!(m.apply(b"M1Q\x02\x05", 13), Effect::default());
         assert_eq!(m.apply(b"M1J\x00\x02\x09", 14), Effect::default());
         assert_eq!(m.queue_count, 3);
-    }
-
-    #[test]
-    fn volume_steps_stay_in_range() {
-        assert_eq!(Model::step_volume(50, 1), 55);
-        assert_eq!(Model::step_volume(50, -1), 45);
-        assert_eq!(Model::step_volume(98, 1), 100);
-        assert_eq!(Model::step_volume(2, -1), 0);
-        assert_eq!(Model::step_volume(0, -5), 0);
     }
 
     #[test]
@@ -930,6 +951,18 @@ mod tests {
         assert!(!m.alive(20));
         assert_eq!(m.apply(b"M1H", 30), Effect { heartbeat: true, ..Effect::default() });
         assert!(m.alive(30));
+    }
+
+    #[test]
+    fn a_search_frame_carries_the_query_and_is_clipped() {
+        let f = Model::search_frame(b"daft punk");
+        assert_eq!(&f[..3], b"M1f");
+        assert_eq!(f[3] as usize, 9);
+        assert_eq!(&f[4..13], b"daft punk");
+        let long = "x".repeat(SEARCH_MAX + 8);
+        let f = Model::search_frame(long.as_bytes());
+        assert_eq!(f[3] as usize, SEARCH_MAX);
+        assert_eq!(&f[4..4 + SEARCH_MAX], &long.as_bytes()[..SEARCH_MAX]);
     }
 
     #[test]

@@ -59,19 +59,38 @@ class WatchProtocolTest {
     }
 
     @Test
-    fun aMultiByteCharacterIsNotSplitByClipping() {
-        // "é" is two UTF-8 bytes: clipping at an odd boundary must drop it whole.
-        val clipped = WatchProtocol.clip("aé", 2)
-        assertEquals("a", String(clipped, Charsets.UTF_8))
+    fun aSearchRequestCarriesItsQuery() {
+        val frame = "M1f".toByteArray() + byteArrayOf(9) + "daft punk".toByteArray()
+        assertEquals(WatchProtocol.Command.Search("daft punk"), WatchProtocol.parse(frame))
+        assertNull(WatchProtocol.parse("M1f".toByteArray()))
+        // An empty query is not a search: the watch only sends a name.
+        assertNull(WatchProtocol.parse("M1f\u0000".toByteArray()))
+        // The length has to match the frame exactly, or the query is read past its end.
+        assertNull(WatchProtocol.parse("M1f\u0003abc!".toByteArray()))
     }
 
     @Test
-    fun sixCategoriesStillFitOneMessage() {
+    fun aTitleIsReducedToWhatTheWatchCanDraw() {
+        // Accents fold, curly quotes and dashes become ASCII, and what has no glyph on the watch is dropped: the stock
+        // fonts would otherwise draw a missing character as nothing (or a `?`) in the middle of a song name.
+        assertEquals("Don't Stop - Me Now", WatchProtocol.plain("Don\u2019t\u00A0Stop \u2013 Me Now"))
+        assertEquals("Cafe del Mar", WatchProtocol.plain("Caf\u00e9 del Mar"))
+        assertEquals("Song name", WatchProtocol.plain("Song \uD83D\uDD25 name"))
+        assertEquals("a...b", WatchProtocol.plain("a\u2026b"))
+        assertEquals("", WatchProtocol.plain("\u65E5\u672C\u8A9E"))
+        // Every frame leaves here as printable ASCII, so a clip can no longer cut a character in half.
+        val clipped = WatchProtocol.clip("aaaaaaaa\u00e9", 4)
+        assertEquals("aaaa", String(clipped, Charsets.UTF_8))
+        assertTrue(clipped.all { it in 0x20..0x7E })
+    }
+
+    @Test
+    fun eightCategoriesStillFitOneMessage() {
         val categories =
-            (1..6).map { index ->
+            (1..8).map { index ->
                 WatchProtocol.Category(
                     id = index,
-                    kind = if (index > 2) WatchProtocol.KIND_FOLDER else WatchProtocol.KIND_SONGS,
+                    kind = if (index > 4) WatchProtocol.KIND_FOLDER else WatchProtocol.KIND_SONGS,
                     // Full-length names: the budget, not the names, has to keep the frame on the wire.
                     name = "Category number $index",
                     colour = 0x1234,
@@ -79,16 +98,47 @@ class WatchProtocolTest {
             }
         val frame = WatchProtocol.categories(categories)
         assertTrue("frame is ${frame.size} bytes", frame.size <= WatchProtocol.MAX_MESSAGE)
-        assertEquals(6, frame[3].toInt())
-        // The names shrink so the whole frame stays on the wire.
+        assertEquals(8, frame[3].toInt())
         var offset = 4
-        repeat(6) {
+        repeat(8) {
             val nameLength = frame[offset + 2].toInt() and 0xFF
             assertTrue("name is $nameLength bytes", nameLength <= WatchProtocol.MAX_NAME)
             offset += 5 + nameLength
         }
         assertEquals(frame.size, offset)
         assertEquals(WatchProtocol.CODE_EMPTY, WatchProtocol.listNone(3, 0)[4].toInt())
+    }
+
+    @Test
+    fun everyShelfNameSurvivesWhenTheFrameFits() {
+        // The old even split cut "Quick picks" to ten bytes while "Explore" left seven unused.
+        val shelves =
+            listOf(
+                "Quick picks",
+                "Listen again",
+                "Downloads",
+                "Library",
+                "Explore",
+                "New releases",
+                "Trending now",
+                "Made for you",
+            )
+        val frame =
+            WatchProtocol.categories(
+                shelves.mapIndexed { index, name ->
+                    WatchProtocol.Category(index + 1, WatchProtocol.KIND_FOLDER, name, 0x3A60)
+                },
+            )
+        assertTrue("frame is ${frame.size} bytes", frame.size <= WatchProtocol.MAX_MESSAGE)
+        var at = 4
+        val names = ArrayList<String>()
+        repeat(shelves.size) {
+            val length = frame[at + 2].toInt() and 0xFF
+            names += String(frame, at + 3, length, Charsets.UTF_8)
+            at += 5 + length
+        }
+        assertEquals(at, frame.size)
+        assertEquals(shelves, names)
     }
 
     @Test

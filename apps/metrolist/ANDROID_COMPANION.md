@@ -46,6 +46,7 @@ phone sends one burst per answer and waits for the watch's next request. Integer
 | `M1v level` | volume `0..=100` |
 | `M1q` | the watch's queue screen opened (or came back to): answer with `Q` and `J` |
 | `M1j index` | play queue entry `index` of the queue the phone has; the rest of the queue stays |
+| `M1f len query` | search the library: answer with the best matches as list frames for `SEARCH_NODE` (`250`) |
 
 The watch retries `?` every 0.6 s, doubling to 3 s, until the phone answers. A list request that is not answered in
 3 s is sent again. Duplicate `p`/`t` frames are idempotent.
@@ -60,6 +61,7 @@ The watch retries `?` every 0.6 s, doubling to 3 s, until the phone answers. A l
 | `M1I node start n (tlen title alen artist colour:u16le id)*` | items `start..start+n` of that list; `n` ≤ 20. A folder item's `id` is the node to browse next; a song's is `0xFF`. `colour` is the item's (or its artwork's average) RGB565 for the watch's row |
 | `M1E node total` | the list is complete |
 | `M1X node code` | no list: `0` empty, `1` error, `2` not ready (still loading, signed out) |
+| `M1B` / `M1I` / `M1E` for node `250` | a search's results, in the same list frames as a node; the watch draws them and `M1p 250 index` plays from there |
 | `M1Q total current` | the queue starts: `total` entries follow (≤ 20), `current` is the playing position |
 | `M1J start n (tlen title alen artist colour:u16le)*` | queue entries `start..start+n`, same text caps as `I`, no node id; the queue is ready at `total` |
 | `M1H` | heartbeat, about every 10 s; the watch shows "Waiting for phone" after 25 s of silence |
@@ -90,6 +92,42 @@ Answer `M1b 0` with `M1C` built from the same data the app's own home screen use
 Names are the app's localized strings, clipped to 20 UTF-8 bytes on a char boundary. Colours come from each shelf's
 artwork (the app's dominant colour) so the watch's rows match the app.
 
+## Search
+
+The watch's keyboard sends the finished query as one `M1f len query` frame (at most 40 UTF-8 bytes, no NUL). The
+phone runs its own search (`YouTubeRepository.search(query)`, which falls back to the local library when offline), keeps
+the first five `SongItem`s and streams them as an ordinary list under node `250`: `M1B 250 1 5 "Results"`, then two `I`
+frames for node `250`, then `M1E 250 5`. An empty result set is still `B`/`E` with `total 0`; a failed search answers
+`M1X 250 1` ("could not load") and a still-loading or signed-out app `M1X 250 2`.
+
+Node `250` is reserved for this and is never part of the browse tree. `M1p 250 index` plays that match and queues the
+rest of the five behind it, in the order the watch showed them; the ack and the queue screen are the node's.
+
+## Quick picks and album shelves
+
+Quick picks and Listen again are the API shelf and the local history together, matched on the `FEmusic_quickpicks` /
+`FEmusic_listen_again` browse id or on the shelf's title and merged by song id. The shelf is not always on the first page
+of the home feed, so the link walks at most two continuation pages while it is missing; when the API has nothing (signed
+out, offline) the local side fills in: `dao.quickPicks()`, then the most played songs of all time, then
+`dao.forgottenFavorites()`, which is the same pool the app's own classic Quick picks samples. Listen again is the last
+month of `mostPlayedSongs`. Quick picks is always a root category, even with no rows at all, so the option does not vanish
+from the watch's menu; its node answers `M1X 1 2` when the phone has neither home data nor history. Each rebuild logs one
+`WatchLink` line with the feed's section count and the shelf's row count, and dumps the feed's titles when the shelf is
+empty.
+
+A home shelf whose items are albums becomes a folder of albums: each row carries a node id, and that node answers with
+the album's own tracks in album order (`YouTubeRepository.getAlbum(browseId)` → `AlbumPage.songs`). `M1p` on that node
+plays the chosen song and queues the rest of the album behind it under the album's title — the same shape as a search's
+results. Not every item type has a watch screen: playlists, artists and podcasts are skipped for now.
+
+The root `C` frame carries up to eight categories. Its names share the space left after the fixed fields in order, each
+taking what it needs and leaving one byte for every name after it, so eight shelves keep their full titles.
+
+Every title and artist leaves this side through `WatchProtocol.clip`, which first reduces the text to printable ASCII
+(`plain`): typographic quotes and dashes become ASCII, accents are folded away, emoji and CJK are dropped, spaces are
+collapsed. The watch's stock fonts have no glyph outside ASCII, and a name cut inside a UTF-8 character was drawn as
+nothing, which is what made some results look empty or wrong.
+
 ## Where it hooks in Metrolist
 
 The pieces this needs already exist; the link is mostly an adapter:
@@ -119,6 +157,7 @@ A node is either a **song list** (`kind 1`) or a **folder** (`kind 0`).
 - A song list answers `M1B`/`M1I`/`M1E` with up to 20 songs. `M1p node index` queues that node's songs from `index`:
   the same order the watch was shown, so `index` means the same row on both sides. Build a fresh queue and start it
   through the app's normal player controller; do not shuffle unless the node itself is a shuffle.
+- An album node is a song list with `fromAlbum`: the watch shows its tracks, and a tap queues the album from that row.
 - A folder answers with folder items (each with a `node` id) and/or song items mixed in the same list, in the app's
   order. Tapping a folder item makes the watch send `M1b <id>`.
 - Depth is the watch's business (it keeps four levels); the phone just answers the node it was asked for.
@@ -165,7 +204,8 @@ channel. Never send the account email, cookies, tokens, file paths or download U
 ## Release gates
 
 - Firmware: channel key `K` needs the patched stub and a loader from 2026-11-13 or later; `own_back`, the LVGL app and
-  its pages need the loaders the app names in its `store.md`.
+  its pages need the loader the app names in `store.md`: **2026-11-27**, `loader-2026-11-27-2018e1a.wp2app`, built from
+  cmf-watch-sdk `2018e1a` and still listed under Experimental in FMC.
 - Android: Nothing X + the fork at the same time on each supported vendor/version (no new pairing popup, both keep
   notifications, the channel survives screen-off and a service restart).
 - Watch: `make test APP=metrolist`, `make build APP=metrolist`, `make check`, then the emulator or a real watch

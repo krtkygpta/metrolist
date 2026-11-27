@@ -3,7 +3,7 @@
 //! and the Metrolist app on the phone does the rest over the app channel (`ANDROID_COMPANION.md`).
 //!
 //! Screens: the start screen (Controller, Metrolist), the player, the phone's queue, the root categories and one
-//! node's folders or songs. The crown changes the volume after a tap on the volume button. Back is the app's own
+//! node's folders or songs. The crown steps the phone's volume, as the volume screen's buttons do. Back is the app's own
 //! (`own_back`): it walks the browse chain and leaves from the start screen; from the queue it returns to the player.
 //! The app is also a watch page (`app_features!(PAGE)`): there it shows the player alone, and the watch keeps the
 //! keys.
@@ -14,6 +14,9 @@ mod model;
 #[cfg_attr(not(any(target_os = "none", wp2_sim)), allow(dead_code))]
 mod screens;
 
+// The app's bitmap assets: bitmaps/*.png -> src/bitmaps.gen.rs, the Material icons its controls draw (bitmaps/README.md).
+cmf_wp2_app::bitmaps!();
+
 #[cfg(not(any(target_os = "none", wp2_sim)))]
 fn main() {}
 
@@ -22,12 +25,15 @@ mod device {
     use crate::model::*;
     use crate::screens::{self, Kind, Screen};
     use cmf_wp2_app::lv::{Batch, Lv, ROOT};
-    use cmf_wp2_app::{Api, BUTTON, CROWN, LV, MESSAGE, MSG_MAX, PAUSE, RESUME};
+    use cmf_wp2_app::{
+        Api, BUTTON, CROWN, LV, MEDIA_VOLUME_DOWN, MEDIA_VOLUME_UP, MESSAGE, MSG_MAX, PAUSE, RESUME,
+    };
 
     cmf_wp2_app::entry!(main);
     cmf_wp2_app::app_icon!();
-    // A menu app and a page next to the watch face (the player alone).
-    cmf_wp2_app::app_features!(cmf_wp2_app::PAGE);
+    // A menu app, a page next to the watch face (the player alone) and a widget card with the phone's track: a long press
+    // on the app's row in Apps offers "Add widget" / "Add page", and a tap on the card starts the app.
+    cmf_wp2_app::app_features!(cmf_wp2_app::WIDGET | cmf_wp2_app::PAGE);
 
     /// The hello goes out again this soon while the phone has not answered; each try waits twice as long.
     const HELLO_MS: u32 = 600;
@@ -36,10 +42,6 @@ mod device {
     const LIST_MS: u32 = 3000;
     /// How long the phone has to ack a play command before the watch says "no answer".
     const PLAY_ACK_MS: u32 = 10_000;
-    /// Crown turns go to the phone at most this often (the last value is always sent).
-    const VOL_GAP_MS: u32 = 120;
-    /// A volume echo from the phone is ignored this long after the crown set it.
-    const VOL_LOCAL_MS: u32 = 1500;
     /// How often the loop wakes when nothing is due (the clock, a late frame).
     const IDLE_MS: u32 = 5000;
     /// The marquee: 3 px every 60 ms, and a pause at each end so the start of the title can be read.
@@ -48,6 +50,20 @@ mod device {
     const ROLL_HOLD_MS: u32 = 1400;
     /// A second back within this long is the same swipe delivered twice, not a second press.
     const BACK_GAP_MS: u32 = 250;
+    /// Where the volume screen's slider starts (0..=VOL_STEPS), until the user moves it.
+    const VOL_START: u8 = 8;
+    /// The widget card's value: 39 bytes, the stub's limit.
+    const WIDGET_VALUE: usize = 40;
+
+    /// `text` in at most `buf.len() - 1` bytes, cut on a char boundary (a half character draws as nothing).
+    fn fit(text: &str, buf: &mut [u8]) -> usize {
+        let mut n = text.len().min(buf.len() - 1);
+        while n > 0 && !text.is_char_boundary(n) {
+            n -= 1;
+        }
+        buf[..n].copy_from_slice(&text.as_bytes()[..n]);
+        n
+    }
 
     static mut MODEL: Model = Model::new();
 
@@ -70,11 +86,7 @@ mod device {
         play_pending: Option<u32>,
         /// The category version the browse page was built from.
         root_seen: u8,
-        vol_dirty: bool,
-        vol_sent_at: u32,
-        vol_local_at: u32,
         last_min: u16,
-        last_vol: u8,
         /// The artwork colour the player's glow was drawn from: a colour the phone repeats is not written again.
         last_colour: u16,
         /// The title the label was last given. Writing it restarts the marquee, and the phone repeats the same title
@@ -95,6 +107,18 @@ mod device {
         on_page: bool,
         /// The `queue_version` the screen was last drawn from.
         queue_seen: u8,
+        /// The search screen's query, as typed on the app's own keyboard. Kept when the screen is left, so a second
+        /// search starts from the last one.
+        query: [u8; SEARCH_MAX],
+        qlen: u8,
+        /// The volume screen's own track (0..=VOL_STEPS): the loader offers the phone's volume keys, not its level, so
+        /// this is what the slider shows and every step of it is one press of a key.
+        vol_level: u8,
+        /// The widget card's last written value, so a NAND write happens only when the track really changed.
+        widget_value: [u8; WIDGET_VALUE],
+        widget_len: u8,
+        /// Set by the start screen's Back arrow: the event loop leaves the app.
+        quit: bool,
     }
 
     impl App {
@@ -124,7 +148,12 @@ mod device {
             let mut clock = [0u8; 5];
             let min = self.clock(&mut clock);
             let text = core::str::from_utf8(&clock).unwrap_or("");
-            let App { b, lv, s, m, .. } = self;
+            let mut qbuf = [0u8; SEARCH_MAX];
+            let qn = self.qlen as usize;
+            qbuf[..qn].copy_from_slice(&self.query[..qn]);
+            let query = core::str::from_utf8(&qbuf[..qn]).unwrap_or("");
+            let App { b, lv, s, m, vol_level, .. } = self;
+            let vol = *vol_level;
             let mut flush = |b: &mut Batch| b.submit(lv);
             if screens::leave(b, s).is_ok() {
                 // The page is gone even if the next build fails: never keep a handle that may be reused.
@@ -135,24 +164,28 @@ mod device {
                 s.back_btn = ROOT;
                 s.queue_btn = ROOT;
                 s.queue_count = 0;
-                s.volume_slider = ROOT;
-                s.volume_text = ROOT;
+                s.volume = ROOT;
+                s.query = ROOT;
+                s.key_count = 0;
             }
             let built = match kind {
                 Kind::Home => screens::home(b, &mut flush),
                 Kind::Controller => screens::controller(b, &mut flush, m, text),
                 Kind::Queue => screens::queue(b, &mut flush, m),
-                Kind::Volume => screens::volume(b, &mut flush, m),
+                Kind::Volume => screens::volume(b, &mut flush, vol),
                 Kind::Browse => screens::browse(b, &mut flush, m),
                 Kind::List => screens::list(b, &mut flush, m),
+                Kind::Search => screens::search(b, &mut flush, query),
             };
             if let Ok(next) = built {
                 *s = next;
-                let _ = b.submit(lv);
+            } else if let Ok(fallback) = screens::notice(b, &mut flush) {
+                // A loader without bitmap assets refuses the player's image records before any record runs.
+                *s = fallback;
             }
+            let _ = b.submit(lv);
             self.last_min = min;
             self.last_now = self.m.now_version;
-            self.last_vol = self.m.now.vol;
             self.last_colour = self.m.now.colour;
             self.root_seen = self.m.root_version;
             // The build wrote the title: remember it so the first refresh does not restart a marquee.
@@ -161,16 +194,11 @@ mod device {
             self.title_seen[..n].copy_from_slice(&self.m.now.title[..n]);
             self.title_len = n as u8;
             self.roll_reset();
+            self.widget();
         }
 
         /// The labels the phone can change without a rebuild.
         fn refresh(&mut self) {
-            if self.s.kind == Kind::Volume {
-                let s = self.s;
-                let _ = screens::show_vol(&mut self.b, &s, self.m.now.vol);
-                let _ = self.b.submit(&self.lv);
-                return;
-            }
             if self.s.kind != Kind::Controller {
                 return;
             }
@@ -192,7 +220,6 @@ mod device {
             }
             let _ = self.b.submit(&self.lv);
             self.last_now = m.now_version;
-            self.last_vol = m.now.vol;
             if new_title {
                 self.title_seen[..n].copy_from_slice(&m.now.title[..n]);
                 self.title_len = n as u8;
@@ -288,6 +315,41 @@ mod device {
             self.send(&frame);
         }
 
+        /// The search screen: the keyboard owns its own screen, and the query is kept between visits.
+        fn enter_search(&mut self) {
+            self.back_to_list = false;
+            self.go(Kind::Search);
+            self.hello_now();
+        }
+
+        fn push_query(&mut self, c: u8) {
+            let n = self.qlen as usize;
+            if n >= SEARCH_MAX {
+                return;
+            }
+            // One space between words, never at the start: both are only noise to the search.
+            if c == b' ' && (n == 0 || self.query[n - 1] == b' ') {
+                return;
+            }
+            self.query[n] = c;
+            self.qlen += 1;
+        }
+
+        /// Sends the typed query and shows the phone's answer as a list, exactly like a node the phone named: the
+        /// five best matches, and a tap plays from that one (the phone queues the rest).
+        fn submit_search(&mut self) {
+            let n = self.qlen as usize;
+            if n == 0 {
+                return;
+            }
+            self.m.open(SEARCH_NODE, "Results");
+            self.go(Kind::List);
+            let frame = Model::search_frame(&self.query[..n]);
+            self.send(&frame[..4 + n]);
+            self.list_deadline = self.now().wrapping_add(LIST_MS);
+            self.play_pending = None;
+        }
+
         /// Opens `node` as a list and asks the phone for it. `push` remembers the way back.
         fn open_list(&mut self, node: u8, title: &str, push: bool) {
             if push {
@@ -347,10 +409,6 @@ mod device {
                     _ => {}
                 }
             }
-            // The crown is ahead of the phone's echo of our own volume change.
-            if fx.now && now.wrapping_sub(self.vol_local_at) < VOL_LOCAL_MS {
-                self.m.now.vol = self.last_vol;
-            }
             if fx.now && matches!(self.s.kind, Kind::Controller | Kind::Volume) {
                 if self.s.kind == Kind::Controller && self.m.now.colour != self.last_colour {
                     // The glow's arcs are cut where the colour really steps in 16 bits, so a colour that lands later
@@ -371,6 +429,9 @@ mod device {
             }
             if fx.root && self.s.kind == Kind::Browse && self.m.root_version != self.root_seen {
                 self.go(Kind::Browse);
+            }
+            if fx.now {
+                self.widget();
             }
             if fx.list && self.s.kind == Kind::List {
                 if fx.done {
@@ -421,7 +482,16 @@ mod device {
                     self.go(Kind::Home);
                     false
                 }
+                Kind::Search => {
+                    self.go(Kind::Home);
+                    false
+                }
                 Kind::List => {
+                    // The results are not a node in the browse chain: back returns to the keyboard, query intact.
+                    if self.m.list_node == SEARCH_NODE {
+                        self.go(Kind::Search);
+                        return false;
+                    }
                     match self.m.pop() {
                         Some(0) => {
                             self.go(Kind::Browse);
@@ -441,16 +511,31 @@ mod device {
             }
         }
 
-        fn tap(&mut self, handle: u16, code: i16) {
+        fn tap(&mut self, handle: u16, code: i16, value: i16) {
+            if code == screens::VALUE_CHANGED {
+                // The volume screen's slider: the phone's volume keys only, so each step it moved is one press.
+                if self.s.kind == Kind::Volume && handle == self.s.volume.0 {
+                    self.apply_volume(value as i32);
+                }
+                return;
+            }
             if code != screens::CLICKED {
                 return;
             }
             match self.s.kind {
-                Kind::Home => match screens::row_at(&self.s, handle) {
-                    Some(0) => self.enter_controller(false),
-                    Some(1) => self.enter_browse(),
-                    _ => {}
-                },
+                Kind::Home => {
+                    if handle == self.s.back_btn.0 {
+                        // The start screen's arrow leaves the app.
+                        self.quit = true;
+                        return;
+                    }
+                    match screens::row_at(&self.s, handle) {
+                        Some(0) => self.enter_search(),
+                        Some(1) => self.enter_browse(),
+                        Some(2) => self.enter_controller(false),
+                        _ => {}
+                    }
+                }
                 Kind::Browse => {
                     let Some(i) = screens::row_at(&self.s, handle) else { return };
                     if i >= self.m.root_count as usize {
@@ -516,65 +601,114 @@ mod device {
                     let _ = self.b.submit(&self.lv);
                 }
                 Kind::Volume => {
-                    // Only the Back pill leaves the volume screen; the capsule and the crown do the rest.
+                    // The slider is read above; the corner arrow is the only button.
                     if handle == self.s.back_btn.0 {
                         self.go(Kind::Controller);
                     }
                 }
-            }
-        }
-
-        // ---- the volume on the crown ----
-
-        fn vol_flush(&mut self, force: bool) {
-            if !self.vol_dirty {
-                return;
-            }
-            let now = self.now();
-            if force || now.wrapping_sub(self.vol_sent_at) >= VOL_GAP_MS {
-                self.send(&Model::volume_frame(self.m.now.vol));
-                self.vol_sent_at = now;
-                self.vol_dirty = false;
-            }
-        }
-
-        /// The crown changes the phone's volume on the player and the volume screen; no arming tap needed.
-        fn crown(&mut self, delta: i16) {
-            if delta == 0 || !matches!(self.s.kind, Kind::Controller | Kind::Volume) {
-                return;
-            }
-            self.vol_local_at = self.now();
-            let level = Model::step_volume(self.m.now.vol, delta);
-            if level != self.m.now.vol {
-                self.m.now.vol = level;
-                self.last_vol = level;
-                self.vol_dirty = true;
-                self.vol_flush(false);
-                if self.s.kind == Kind::Volume {
+                Kind::Search => {
+                    if handle == self.s.back_btn.0 {
+                        self.go(Kind::Home);
+                        return;
+                    }
+                    let Some(code) = screens::key_at(&self.s, handle) else { return };
+                    match code {
+                        screens::KEY_GO => {
+                            self.submit_search();
+                            return;
+                        }
+                        screens::KEY_DEL => {
+                            if self.qlen > 0 {
+                                self.qlen -= 1;
+                            }
+                        }
+                        screens::KEY_SPACE => self.push_query(b' '),
+                        letter if letter < 26 => self.push_query(b'a' + letter),
+                        _ => return,
+                    }
+                    // The box is redrawn in place: no page rebuild per key, so the keyboard never flickers.
+                    let mut text = [0u8; SEARCH_MAX];
+                    let n = self.qlen as usize;
+                    text[..n].copy_from_slice(&self.query[..n]);
+                    let shown = core::str::from_utf8(&text[..n]).unwrap_or("");
                     let s = self.s;
-                    let _ = screens::show_vol(&mut self.b, &s, level);
+                    let _ = screens::show_query(&mut self.b, &s, shown);
                     let _ = self.b.submit(&self.lv);
                 }
             }
         }
 
-        /// The volume screen's capsule, mid-drag: show it at once and send when it is let go.
-        fn volume_drag(&mut self, value: i16) {
-            let level = value.clamp(0, 100) as u8;
-            if level == self.m.now.vol {
+        // ---- the phone's volume ----
+
+        /// Moves the phone's own media volume to step `level` of the app's track, as the stock volume popup does
+        /// (`MEDIA_KEY` 5 and 6): the phone applies it to its system volume, so this is the volume the user hears, not a
+        /// gain inside the music app. Only the steps that reach the phone are kept, so a slider dragged while the phone
+        /// refuses it snaps back to where the volume really is, and the screen says why.
+        fn apply_volume(&mut self, level: i32) {
+            let target = level.clamp(0, screens::VOL_STEPS) as u8;
+            let mut at = self.vol_level;
+            let mut rc = 0;
+            while at < target {
+                rc = self.api.media_key(MEDIA_VOLUME_UP);
+                if rc < 0 {
+                    break;
+                }
+                at += 1;
+            }
+            while at > target {
+                rc = self.api.media_key(MEDIA_VOLUME_DOWN);
+                if rc < 0 {
+                    break;
+                }
+                at -= 1;
+            }
+            self.vol_level = at;
+            if self.s.kind != Kind::Volume {
                 return;
             }
-            self.m.now.vol = level;
-            self.last_vol = level;
-            self.vol_local_at = self.now();
-            self.vol_dirty = true;
+            let text = if rc < 0 {
+                match rc {
+                    -19 => "No phone media",
+                    -22 => "Needs a newer loader",
+                    _ => "Volume refused",
+                }
+            } else {
+                screens::VOL_MSG
+            };
             let s = self.s;
-            let _ = screens::show_vol(&mut self.b, &s, level);
+            let _ = screens::show_volume(&mut self.b, &s, at, text);
             let _ = self.b.submit(&self.lv);
         }
 
-        fn vol_tick(&mut self) {
-            self.vol_flush(false);
+        /// The crown steps the phone's volume on the player and on the volume screen, one step per detent.
+        fn crown(&mut self, delta: i16) {
+            if delta == 0 || !matches!(self.s.kind, Kind::Controller | Kind::Volume) {
+                return;
+            }
+            self.apply_volume(self.vol_level as i32 + if delta > 0 { 1 } else { -1 });
+        }
+
+        // ---- the widget card ----
+
+        /// The card left of the watch face shows the track the phone plays (its tap starts the app). The stub draws it
+        /// from a record the app writes to NAND, so it is written only when the text changed, never per frame.
+        fn widget(&mut self) {
+            let mut buf = [0u8; WIDGET_VALUE];
+            let text = if !self.m.connected {
+                "Waiting for phone"
+            } else if self.m.now.has {
+                self.m.now.title()
+            } else {
+                "Nothing playing"
+            };
+            let n = fit(text, &mut buf);
+            if n == self.widget_len as usize && self.widget_value[..n] == buf[..n] {
+                return;
+            }
+            let _ = self.api.widget("Metrolist", core::str::from_utf8(&buf[..n]).unwrap_or(""));
+            self.widget_value = [0; WIDGET_VALUE];
+            self.widget_value[..n].copy_from_slice(&buf[..n]);
+            self.widget_len = n as u8;
         }
 
         // ---- timers ----
@@ -589,8 +723,15 @@ mod device {
                 self.hello();
             }
             if self.s.kind == Kind::List && !self.m.list_ready && after(now, self.list_deadline) {
-                let frame = Model::browse_frame(self.m.list_node);
-                self.send(&frame);
+                // A search is not a node: ask again with what is in the query box instead of browsing node 250.
+                let n = self.qlen as usize;
+                if self.m.list_node == SEARCH_NODE && n > 0 {
+                    let frame = Model::search_frame(&self.query[..n]);
+                    self.send(&frame[..4 + n]);
+                } else {
+                    let frame = Model::browse_frame(self.m.list_node);
+                    self.send(&frame);
+                }
                 self.list_deadline = now.wrapping_add(LIST_MS);
             }
             if let Some(deadline) = self.play_pending {
@@ -612,7 +753,6 @@ mod device {
                 }
             }
             self.roll_tick();
-            self.vol_tick();
         }
 
         fn wait(&self) -> u32 {
@@ -626,9 +766,6 @@ mod device {
             }
             if self.play_pending.is_some() {
                 w = w.min(1000);
-            }
-            if self.vol_dirty {
-                w = w.min(VOL_GAP_MS.saturating_sub(now.wrapping_sub(self.vol_sent_at)));
             }
             if self.rolling() {
                 w = w.min((self.roll_at.wrapping_sub(now) as i32).max(0) as u32);
@@ -673,11 +810,7 @@ mod device {
             list_deadline: 0,
             play_pending: None,
             root_seen: 0,
-            vol_dirty: false,
-            vol_sent_at: 0,
-            vol_local_at: 0,
             last_min: u16::MAX,
-            last_vol: 0,
             last_colour: 0,
             title_seen: [0; TITLE_MAX],
             title_len: 0,
@@ -689,6 +822,12 @@ mod device {
             last_back: 0,
             on_page: api.on_page(),
             queue_seen: 0,
+            query: [0; SEARCH_MAX],
+            qlen: 0,
+            vol_level: VOL_START,
+            widget_value: [0; WIDGET_VALUE],
+            widget_len: 0,
+            quit: false,
         };
         if app.on_page {
             // The watch's page next to the face: the player alone, no way out (the watch keeps the keys).
@@ -727,12 +866,10 @@ mod device {
                     app.refresh();
                 }
                 Some(e) if e.kind == LV => {
-                    if e.y == screens::VALUE_CHANGED && e.x as u16 == app.s.volume_slider.0 {
-                        app.volume_drag(e.delta);
-                    } else if e.y == screens::RELEASED && e.x as u16 == app.s.volume_slider.0 {
-                        app.vol_flush(true);
-                    } else {
-                        app.tap(e.x as u16, e.y);
+                    app.quit = false;
+                    app.tap(e.x as u16, e.y, e.delta);
+                    if app.quit && !app.on_page {
+                        return 0;
                     }
                 }
                 _ => {}

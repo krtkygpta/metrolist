@@ -71,6 +71,7 @@ class WatchLinkService : Service() {
     private var kinds: Map<Int, Kind> = emptyMap()
     private var connectJob: Job? = null
     private var installJob: Job? = null
+    private var searchJob: Job? = null
     private var installRequested = false
 
     @Volatile
@@ -160,6 +161,8 @@ class WatchLinkService : Service() {
         connectJob = null
         installJob?.cancel()
         installJob = null
+        searchJob?.cancel()
+        searchJob = null
         installRequested = false
         channel?.let { runCatching { it.close() } }
         channel = null
@@ -341,11 +344,14 @@ class WatchLinkService : Service() {
                 WatchProtocol.Command.Queue -> sendQueue(link)
 
                 is WatchProtocol.Command.QueuePlay -> playQueue(link, command.index)
+
+                is WatchProtocol.Command.Search -> search(link, command.query)
             }
             // Authoritative state after every command: the watch never keeps an optimistic value.
             if (command !is WatchProtocol.Command.Hello &&
                 command !is WatchProtocol.Command.Browse &&
-                command !is WatchProtocol.Command.Queue
+                command !is WatchProtocol.Command.Queue &&
+                command !is WatchProtocol.Command.Search
             ) {
                 sendNow(link, snapshot())
             }
@@ -514,6 +520,29 @@ class WatchLinkService : Service() {
         }
     }
 
+    /**
+     * A name typed on the watch. The search itself runs off the link loop (a network round trip would stall the
+     * heartbeat) and its answer is an ordinary list for `SEARCH_NODE`, so the watch draws and taps it like any node.
+     */
+    private fun search(
+        link: WatchChannel,
+        query: String,
+    ) {
+        searchJob?.cancel()
+        searchJob =
+            scope.launch {
+                Log.i(TAG, "search: $query")
+                val node = content?.search(query)
+                if (node == null) {
+                    Log.w(TAG, "search failed: no results for \"$query\"")
+                    send(link, WatchProtocol.listNone(WatchProtocol.SEARCH_NODE, WatchProtocol.CODE_ERROR), "search failed")
+                    return@launch
+                }
+                book.put(node)
+                sendList(link, WatchProtocol.SEARCH_NODE)
+            }
+    }
+
     // ---- bundled watch package ----
 
     private fun setInstallState(
@@ -662,6 +691,8 @@ class WatchLinkService : Service() {
         }
         val songs = visible.filterIsInstance<Entry.Track>().map { it.song }
         val songIndex = visible.take(index).count { it is Entry.Track }
+        // An album's track list queues the rest of the album behind the song that was tapped.
+        val albumTitle = if (node.fromAlbum) node.title else null
         if (songIndex !in songs.indices || songs[songIndex].id != selectedEntry.song.id) {
             Log.w(TAG, "play rejected: node $nodeId row $index mapped to queue index $songIndex")
             send(link, WatchProtocol.ack(WatchProtocol.ACK_REFUSED), "play ack")
@@ -684,6 +715,12 @@ class WatchLinkService : Service() {
                 // The ack only goes out when the requested song really became the current one, so the watch's
                 // "Playing..." tells the truth about the whole chain: frame received, processed, playback switched.
                 val switched = player.playSongFromWatch(selected)
+                // The queue is the list the watch just saw: the other search matches, or the rest of the album.
+                val queueTitle = if (nodeId == WatchProtocol.SEARCH_NODE) "Search" else albumTitle
+                if (switched && queueTitle != null) {
+                    player.setQueueTitleFromRemote(queueTitle)
+                    player.replaceUpcomingQueueFromRemote(songs.drop(songIndex + 1))
+                }
                 Log.i(TAG, "play " + if (switched) "confirmed" else "NOT confirmed: song=${selected.id}")
                 send(link, WatchProtocol.ack(if (switched) WatchProtocol.ACK_PLAYING else WatchProtocol.ACK_NO_SWITCH), "play ack")
             } catch (cancelled: CancellationException) {

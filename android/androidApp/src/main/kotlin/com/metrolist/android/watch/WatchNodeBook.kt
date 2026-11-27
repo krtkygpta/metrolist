@@ -49,6 +49,8 @@ internal class WatchNodeBook {
         val entries: List<Entry>,
         /** The phone could not read the data yet (signed out or still loading): answer "not ready", not "empty". */
         val notReady: Boolean = false,
+        /** An album's track list: choosing a song there queues the rest of the album behind it. */
+        val fromAlbum: Boolean = false,
     ) {
         /** The watch keeps the first 20 rows of any list. */
         val shown: List<Entry> get() = entries.take(WatchProtocol.MAX_ITEMS)

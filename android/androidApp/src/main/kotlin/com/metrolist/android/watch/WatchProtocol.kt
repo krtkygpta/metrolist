@@ -6,6 +6,7 @@
 package com.metrolist.android.watch
 
 import java.io.ByteArrayOutputStream
+import java.text.Normalizer
 import kotlin.math.min
 
 /**
@@ -20,7 +21,9 @@ import kotlin.math.min
 internal object WatchProtocol {
     const val MAX_MESSAGE = 128
     const val MAX_ITEMS = 20
-    const val MAX_ROOT = 6
+
+    /** Root categories on one `C` frame: the app's own shelves fit in eight (see [categories]). */
+    const val MAX_ROOT = 8
     const val MAX_TITLE = 34
     const val MAX_ARTIST = 20
     const val MAX_NAME = 20
@@ -41,6 +44,15 @@ internal object WatchProtocol {
     const val CMD_NEXT = 1
     const val CMD_PREV = 2
 
+    /** The node a search's results are streamed as. It is never part of the browse tree. */
+    const val SEARCH_NODE = 250
+
+    /** How many of the phone's best matches the watch is shown. */
+    const val MAX_SEARCH = 5
+
+    /** The longest query the watch's keyboard sends; an `f` frame is far under [MAX_MESSAGE] with it. */
+    const val MAX_QUERY = 40
+
     private val MAGIC_A = 'M'.code.toByte()
     private val MAGIC_B = '1'.code.toByte()
 
@@ -52,6 +64,7 @@ internal object WatchProtocol {
     private val VOLUME = 'v'.code.toByte()
     private val QUEUE_REQ = 'q'.code.toByte()
     private val QUEUE_PLAY = 'j'.code.toByte()
+    private val SEARCH = 'f'.code.toByte()
 
     private val NOW = 'S'.code.toByte()
     private val CATEGORIES = 'C'.code.toByte()
@@ -120,16 +133,49 @@ internal object WatchProtocol {
 
         /** Play queue entry `index` of the queue the phone already has. */
         data class QueuePlay(val index: Int) : Command
+
+        /** Search the library: answer with the best matches as list frames for [SEARCH_NODE]. */
+        data class Search(val query: String) : Command
     }
 
     /**
-     * `text` clipped to at most `max` UTF-8 bytes without splitting a character.
+     * Text as the watch can draw it. The watch's stock fonts have only printable ASCII, and a name the phone cut inside a
+     * character is drawn as nothing at all, which is what made some search results look empty or wrong. So: typographic
+     * quotes, dashes and the ellipsis become their ASCII forms, accents are folded away (`é` → `e`), everything the
+     * watch has no glyph for (emoji, CJK, combining marks) is dropped, and runs of spaces collapse to one.
+     */
+    fun plain(text: String): String {
+        val out = StringBuilder(text.length)
+        for (ch in Normalizer.normalize(text, Normalizer.Form.NFD)) {
+            val c =
+                when (ch) {
+                    '\u2018', '\u2019', '\u201A', '\u2032' -> '\''
+                    '\u201C', '\u201D', '\u201E', '\u2033' -> '"'
+                    '\u2013', '\u2014', '\u2010', '\u2011', '\u2212' -> '-'
+                    '\u00D7' -> 'x'
+                    // Unusual spaces are still spaces: they only become 0x20, never a missing word break.
+                    '\u00A0', '\u2007', '\u2009', '\u200A', '\u202F' -> ' '
+                    else -> ch
+                }
+            when {
+                c.code in 0x20..0x7E -> out.append(c)
+                // One glyph the watch has no character for, but three dots read the same.
+                ch == '\u2026' -> out.append("...")
+                else -> {}
+            }
+        }
+        // Collapses the runs a dropped character can leave, and trims both ends.
+        return out.toString().split(' ').filter { it.isNotEmpty() }.joinToString(" ")
+    }
+
+    /**
+     * `text` as the watch can draw it ([plain]), clipped to at most `max` bytes without splitting a character.
      */
     fun clip(
         text: String,
         max: Int,
     ): ByteArray {
-        val bytes = text.toByteArray(Charsets.UTF_8)
+        val bytes = plain(text).toByteArray(Charsets.UTF_8)
         if (bytes.size <= max) return bytes
         var end = max
         while (end > 0 && (bytes[end].toInt() and 0xC0) == 0x80) end--
@@ -167,20 +213,24 @@ internal object WatchProtocol {
 
     fun categories(categories: List<Category>): ByteArray {
         val kept = categories.take(MAX_ROOT)
-        // 4 header bytes, then 5 per category (id, kind, name length, colour: u16): the names share what is left.
-        val nameBudget = if (kept.isEmpty()) 0 else (MAX_MESSAGE - 4 - kept.size * 5) / kept.size
+        // 4 header bytes, then 5 per category (id, kind, name length, colour: u16). The names share what is left, in
+        // order: each takes what it needs and leaves one byte for every name after it. An even split cut "Quick picks"
+        // to ten characters while "Explore" threw seven away, which is what truncated the shelves.
         val out = ByteArrayOutputStream(MAX_MESSAGE)
         out.write(MAGIC_A.toInt())
         out.write(MAGIC_B.toInt())
         out.write(CATEGORIES.toInt())
         out.write(kept.size)
-        for (category in kept) {
-            val name = clip(category.name, min(MAX_NAME, nameBudget))
+        var room = (MAX_MESSAGE - 4 - kept.size * 5).coerceAtLeast(0)
+        kept.forEachIndexed { index, category ->
+            val after = kept.size - index - 1
+            val name = clip(category.name, min(MAX_NAME, room - after).coerceAtLeast(0))
             out.write(category.id)
             out.write(category.kind)
             out.write(name.size)
             out.write(name)
             writeU16(out, category.colour and 0xFFFF)
+            room -= name.size
         }
         return out.toByteArray()
     }
@@ -310,6 +360,16 @@ internal object WatchProtocol {
                 } else {
                     null
                 }
+
+            SEARCH -> {
+                // `f len query`: the length has to match the frame exactly, and an empty query is not a search.
+                val length = if (message.size >= 4) message[3].u8() else -1
+                if (length <= 0 || length > MAX_QUERY || message.size != 4 + length) {
+                    null
+                } else {
+                    String(message, 4, length, Charsets.UTF_8).trim().takeIf { it.isNotEmpty() }?.let(Command::Search)
+                }
+            }
 
             else -> null
         }

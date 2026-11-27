@@ -1,5 +1,5 @@
 name = "Metrolist"
 summary = "Browse and play your Metrolist library from the watch, and control the phone's playback"
-version = "0.11.6"
+version = "0.13.0"
 author = "CMF Tech Community"
 screenshots = ["shots/player.jpg", "shots/home.jpg", "shots/queue.jpg"]

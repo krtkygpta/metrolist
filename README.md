@@ -52,7 +52,8 @@ from a PC.
 
 - A CMF Watch Pro 2 with the [FMC patched firmware and App Loader](https://fmc.freethinkel.dev/firmware): the channel
   key needs a stub and loader from 2026-11-13 or newer, and this app (it owns Back, pages the controller sideways and
-  draws with the stock LVGL widgets) a loader from 2026-11-16 or newer. Stock firmware has no app channel at all.
+  draws with the stock LVGL widgets) the App Loader of 2026-11-27, `loader-2026-11-27-2018e1a.wp2app` (cmf-watch-sdk `2018e1a`, still listed under
+  Experimental in FMC, so pick it from there). Stock firmware has no app channel at all.
 - Android 9 or newer on the phone, with the Nothing X app still installed — the link rides the existing bond.
 - One central at a time: while the phone is connected, no other device (a Mac, say) can hold the watch.
 
